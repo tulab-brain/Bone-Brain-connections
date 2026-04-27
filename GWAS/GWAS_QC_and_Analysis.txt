@@ -1,0 +1,155 @@
+###################################################################################
+########################### Pre-GWAS Quality Control ##############################
+###################################################################################
+
+# ===== Sample-level QC in R =====
+# input:
+# - All samples from UK Biobank: Sample_all
+# - Samples who have pass QC in phenotype data: ID_phenotype_QCpass
+# output:
+# - list of samples that passed QC: sbj_id.txt
+
+library(data.table)
+library(dplyr)
+
+qc_raw <- fread("path to Sample_all")
+ID_phenotype_QCpass <- fread("path to ID_phenotype_QCpass")
+
+qc_raw[is.na(qc_raw)] <- ""
+sample_qc_pass <- qc_raw %>%
+  filter(
+    `22019-0.0` != 1, # exclude samples with sex chromosome aneuploidy
+    `22006-0.0` == 1, # include only White British individuals of European ancestry
+    `22021-0.0` != 10, # exclude individuals with 10 or more third-degree relatives
+    `22027-0.0` != 1 # exclude samples flagged as outliers for heterozygosity/missing rates
+    ) 
+
+sbj_id <- ID_phenotype_QCpass %>%	
+	inner_join(select(sample_qc_pass, FID), by = "FID") 
+
+
+# ===== Remove poorly-imputed SNPs in R =====
+# input: 
+# - imputation info files from UK Biobank: ukb_mfi_chrN_v3.txt
+# output:
+# - list of SNPs with info score >= 0.5: snp_info05.txt
+
+library(dplyr)
+library(purrr)
+
+mfi_allChrs <- map_dfr(1:22, ~ read.delim(paste0("ukb_mfi_chr", .x, "_v3.txt"), 
+                                               header = FALSE) %>%
+                              filter(V8 >= 0.5))
+
+snp_info05 <- unique(mfi_allChrs$V2)
+
+
+# ===== Filtering Non-imputed Genotype Data for Selected Samples =====
+# input: 
+# - genotype data: ukb_cal_allChrs
+# - list of participant IDs: sbj_id.txt
+# output:
+# - filtered genotype data: filtered_genotype
+
+./plink2 --bfile ukb_cal_allChrs \
+--keep sbj_id.txt \
+--make-bed \
+--out filtered_genotype
+
+
+# ===== SNP-level QC of Non-imputed Genotype Data =====
+# input:
+# - filtered genotype data: filtered_genotype
+# output:
+# - QC-passed genotype data: qc_pass
+
+./plink2 --bfile filtered_genotype \
+--maf 0.005 --geno 0.1 --hwe 1e-7 \
+--make-bed \
+--out qc_pass
+
+
+# ===== Filtering Imputed Genotype Data for Selected Samples =====
+# input:
+# - imputed genotype data: ukbXXX_imp_cN_v3.bgen, ukbXXX_imp_cN_v3_s487162.sample
+# - list of participant IDs: sbj_id.txt
+# - list of SNPs with info score >= 0.5: snp_info05.txt
+# output:
+# - filtered imputed genotype data: filtered_impgenotype_cN
+
+for chr in {1..22}; do
+  ./plink2 --bgen ukbXXX_imp_c${chr}_v3.bgen 'ref-first' \
+  --sample ukbXXX_imp_c${chr}_v3_s487162.sample \
+  --extract snp_info05.txt \
+  --keep sbj_id.txt \
+  --make-pgen \
+  --out filtered_impgenotype_c${chr}
+done
+
+
+# ===== SNP-level QC of Imputed Genotype Data =====
+# input:
+# - filtered imputed genotype data: filtered_impgenotype_cN
+# output:
+# - QC-passed imputed genotype data: qc_pass_imp_cN
+
+for chr in {1..22}; do
+  ./plink2 --pfile filtered_impgenotype_c${chr} \
+  --hwe 1e-7 --geno 0.1 --maf 0.005 \
+  --make-pgen \
+  --out qc_pass_imp_c${chr}
+  done
+
+
+###################################################################################
+########################## Running GWAS Using Regenie #############################
+###################################################################################
+
+# ===== Step 1: Whole Genome Regression Model =====
+# input:
+# - phenotype data files: pheno_folder/*
+# - covariates data file: cov.txt
+# - QC-passed genotype data: qc_pass
+# output:
+# - regenie step1 output data: GWAS_step1_*
+
+for file in pheno_folder/*.txt; do
+  filename=$(basename "$file" .txt)
+  regenie \
+  --step 1 \
+  --bed qc_pass \
+  --phenoFile "$file" \
+  --covarFile cov.txt \
+  --bsize 100 \
+  --strict \
+  --lowmem-prefix tmp_rg \
+  --out GWAS_step1_${filename} \
+  --qt --loocv --threads 40 --gz  
+done
+
+
+# ===== Step 2: Association testing =====
+# input:
+# - phenotype data files: pheno_folder/*
+# - covariates data file: cov.txt
+# - QC-passed imputed genotype data: qc_pass_imp_cN
+# output:
+# - separate association results files for each phenotype: GWAS_step2_cN
+
+for file in pheno_folder/*.txt; do
+  filename=$(basename "$file" .txt)
+  mkdir -p "${filename}"
+  for chr in {1..22}; do
+    regenie \
+      --step 2 \
+      --pgen qc_pass_imp_c${chr} \
+      --ref-first \
+      --phenoFile "${file}" \
+      --covarFile cov.txt \
+      --qt \
+      --pred GWAS_step1_${filename}_pred.list \
+      --bsize 400 \
+      --threads 50 \
+      --out ${filename}/GWAS_step2_c${chr}
+    done
+  done
